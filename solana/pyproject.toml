@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "CrytoTools-Solana"
+version = "0.1.0"
+description = "Solana tools for traiders"
+readme = "README.md"
+requires-python = ">=3.14"
+license = "MIT"
+
+# Phase 0 needs only configuration, logging and the secrets store. The modelling
+# stack is declared here because Phase 1 starts immediately after, but nothing in
+# Phase 0 imports it.
+dependencies = [
+    "solders>=0.29.0",
+    "solana>=0.40.3",
+    "jito-py-rpc>=0.1.5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "types-PyYAML>=6.0",
+    "types-requests>=2.32",
+]
+
+[project.scripts]
+solana-tools = "solana_tools.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+btc_ai = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
