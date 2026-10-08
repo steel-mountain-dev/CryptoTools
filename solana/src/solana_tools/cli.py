@@ -22,6 +22,7 @@ from solders.system_program import TransferParams, transfer
 from solders.transaction import VersionedTransaction
 
 import spl.token.instructions as spl_token
+from spl.token.constants import TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID
 from spl.token.models import CloseAccountParams
 
 # Cluster	Public RPC endpoint	Description
@@ -70,8 +71,8 @@ class TokenAccount:
 
 
 class TokenType(Enum):
-    TOKEN_KEG  = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"),
-    TOKEN_2022 = Pubkey.from_string("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
+    TOKEN_KEG  = TOKEN_PROGRAM_ID,
+    TOKEN_2022 = TOKEN_2022_PROGRAM_ID
 
     def __init__(self, address):
         self.address = address
@@ -293,7 +294,7 @@ async def _show_wallet_status() -> None:
     colors = ConsoleColors()
     print(colors.title("Balance information"))
     print(colors.section("    closable accounts:\t\t") + colors.data(f"{len(accounts)} =>  " + colors.summary(f"{keg_accounts} token-keg + {twenty_twenty_accounts} token-2020")))
-    print(colors.section("    recoverable SOL:\t\t") + colors.data(f"{lamports / LAMPORTS_PER_SOL:.2f}"))
+    print(colors.section("    recoverable SOL:\t\t") + colors.data(f"{lamports / LAMPORTS_PER_SOL}"))
     print(colors.section("    lamports:\t\t\t") + colors.data(f"{lamports}"))
     print(colors.section("    approximate close costs:\t") + colors.data(f"{cost / LAMPORTS_PER_SOL :.6f} SOL"))
 
@@ -334,15 +335,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     """
     args = build_parser().parse_args(argv)
 
-    print(f"bundles? {args.bundles}")
     try:
         match args.command:
             case "show":
                 asyncio.run(_show_wallet_status())
             case "close_accounts":
                 asyncio.run(_close_all_accounts(use_bundles=args.bundles))
+    except KeyboardInterrupt as e:
+        print(ConsoleColors().error("\nCancelled."))
+        return 130
     except Exception as e:
-        # traceback.print_exc()
         print(ConsoleColors().error(e.__str__()))
         return 1
     return 0
