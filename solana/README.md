@@ -7,7 +7,7 @@ Both token programs are supported: SPL Token (Tokenkeg) and Token-2022.
 
 > **Note:** The tools connect to **Solana mainnet** (`https://api.mainnet.solana.com`), and
 > `close_accounts` sends real transactions through the Jito block engine. Each transaction
-> closes up to 60 accounts and costs the network fee plus a 1,000-lamport Jito tip.
+> closes up to 59 accounts and costs the network fee plus a 1,000-lamport Jito tip.
 
 ## Requirements
 
@@ -128,9 +128,28 @@ Transaction IDs: ['5x...', ...]
 
 How it works:
 
-- Up to 60 close instructions go into each transaction.
+- Up to 59 close instructions go into each transaction.
 - Each transaction includes a Jito tip and is sent through the Jito block engine.
 - Transactions go out at most once per second, to respect Jito's rate limit.
+
+#### `--bundles`: send Jito bundles instead
+
+```bash
+solana-tools close_accounts --bundles
+```
+
+```text
+Wallet private key: ********
+address: <your-public-address>
+Accounts Processed: 12/12
+Bundle IDs: ['3f...', ...]
+```
+
+- Transactions are grouped into Jito bundles of up to 5, so up to 295 accounts per bundle.
+- Only the first transaction of each bundle pays a tip. The tip is Jito's live tip floor
+  (25th percentile of landed tips plus 5%), never less than 1,000 lamports. If the tip floor
+  can't be fetched, it falls back to 1,000 lamports.
+- A bundle lands all-or-nothing: if one transaction in it fails, none of them are applied.
 
 > **Security:** Your private key never leaves your machine and is not saved. It only signs
 > transactions locally. Run this command only on a machine you trust, and run `show` first

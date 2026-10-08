@@ -29,7 +29,7 @@ from spl.token.models import CloseAccountParams
 # Devnet	https://api.devnet.solana.com	Developer testing network. Use the Solana Faucet to get Devnet SOL.
 # Testnet	https://api.testnet.solana.com	Validator testing network.
 
-MAX_CLOSE_INSTRUCTIONS_PER_TRANSACTION: Final[int] = 60
+MAX_CLOSE_INSTRUCTIONS_PER_TRANSACTION: Final[int] = 59
 COMPUTE_UNITS_PER_INSTRUCTION: Final[int] = 300
 MIN_JITO_TIP: Final[int] = 1000
 JITO_RPC_SDK:  Final[str] = 'https://mainnet.block-engine.jito.wtf/api/v1'
@@ -52,7 +52,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
     sub.add_parser("show", help="Retrieve all zero balance accounts and report")
-    sub.add_parser("close_accounts", help="Close all zero balance token accounts")
+    close = sub.add_parser("close_accounts", help="Close all zero balance token accounts")
+    close.add_argument(
+        "--bundles",
+        action="store_true",
+        help=f"send Jito bundles of up to {JITO_TRANSACTIONS_PER_BUNDLE} transactions, "
+             "with one tip per bundle at the live tip floor",
+    )
 
     return parser
 
@@ -179,9 +185,9 @@ async def _close_all_accounts(use_bundles: bool = False) -> None:
         )
 
     if use_bundles:
-        _close_all_accounts_bundle(close_instructions, private_key, jito_client, client, jito_tip_account)
+        await _close_all_accounts_bundle(close_instructions, private_key, jito_client, client, jito_tip_account)
     else:
-        _close_all_accounts_single_tx(close_instructions, private_key, jito_client, client, jito_tip_account)
+        await _close_all_accounts_single_tx(close_instructions, private_key, jito_client, client, jito_tip_account)
 
     await client.close()
 
@@ -229,7 +235,7 @@ async def _close_all_accounts_bundle(close_instructions: list[Instruction], priv
         bundle = []
 
         for index, instruction_set in enumerate(chunk):
-            processed_accounts = + len(instruction_set)
+            processed_accounts += len(instruction_set)
             base_instructions = []
             if index == 0:
                 bundle_tip = _get_minimum_jito_tip_in_lamports()
@@ -242,13 +248,12 @@ async def _close_all_accounts_bundle(close_instructions: list[Instruction], priv
                 )
 
             recent_blockhash = await client.get_latest_blockhash()
-            message = Message.new_with_blockhash(
-                base_instructions + list(instruction_set),
+            message = MessageV1.try_compile(
                 private_key.pubkey(),
+                base_instructions + list(instruction_set),
                 recent_blockhash.value.blockhash
             )
-            transaction = Transaction.new_unsigned(message)
-            transaction.sign([private_key], recent_blockhash.value.blockhash)
+            transaction = VersionedTransaction(message, [private_key])
             bundle.append(base64.b64encode(bytes(transaction)).decode('ascii'))
 
         result = jito_client.send_bundle(bundle)
@@ -329,13 +334,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     """
     args = build_parser().parse_args(argv)
 
-
+    print(f"bundles? {args.bundles}")
     try:
         match args.command:
             case "show":
                 asyncio.run(_show_wallet_status())
             case "close_accounts":
-                asyncio.run(_close_all_accounts())
+                asyncio.run(_close_all_accounts(use_bundles=args.bundles))
     except Exception as e:
         # traceback.print_exc()
         print(ConsoleColors().error(e.__str__()))

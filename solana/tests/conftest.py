@@ -49,20 +49,28 @@ class FakeAsyncClient:
 
 
 class FakeJitoClient:
-    """Stand-in for ``jito_py_rpc.JitoJsonRpcSDK`` that records sent transactions."""
+    """Stand-in for ``jito_py_rpc.JitoJsonRpcSDK`` that records sent transactions and bundles."""
 
     def __init__(self, fail: bool = False):
         self.fail = fail
+        self.tip_account = Pubkey.new_unique()
         self.sent: list[str] = []
+        self.bundles: list[list[str]] = []
 
     def get_random_tip_account(self) -> str:
-        return str(Pubkey.new_unique())
+        return str(self.tip_account)
 
     def send_txn(self, params: str, bundleOnly: bool = False) -> dict[str, Any]:
         self.sent.append(params)
         if self.fail:
             return {"success": False, "error": "rejected"}
         return {"success": True, "data": {"result": f"sig{len(self.sent)}"}}
+
+    def send_bundle(self, bundle: list[str]) -> dict[str, Any]:
+        self.bundles.append(bundle)
+        if self.fail:
+            return {"success": False, "error": "rejected"}
+        return {"success": True, "data": {"result": f"bundle{len(self.bundles)}"}}
 
 
 @pytest.fixture

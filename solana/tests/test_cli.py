@@ -5,7 +5,8 @@ import pytest
 from solana.constants import LAMPORTS_PER_SOL
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
-from solders.transaction import Transaction
+from solders.system_program import TransferParams, transfer
+from solders.transaction import VersionedTransaction
 
 from solana_tools import cli
 from tests.conftest import (
@@ -18,6 +19,13 @@ from tests.conftest import (
 
 KEG = cli.TokenType.TOKEN_KEG.address
 T2022 = cli.TokenType.TOKEN_2022.address
+PER_TX = cli.MAX_CLOSE_INSTRUCTIONS_PER_TRANSACTION
+PER_BUNDLE = cli.JITO_TRANSACTIONS_PER_BUNDLE
+MAX_V1_ACCOUNT_KEYS = 64
+
+
+def empty_accounts(count: int) -> list:
+    return [make_rpc_account(0.0) for _ in range(count)]
 
 
 # --- argument parsing -------------------------------------------------------
@@ -28,7 +36,15 @@ def test_parser_accepts_commands(command: str) -> None:
     assert cli.build_parser().parse_args([command]).command == command
 
 
-@pytest.mark.parametrize("argv", [[], ["unknown"]])
+@pytest.mark.parametrize(
+    ("argv", "use_bundles"),
+    [(["close_accounts"], False), (["close_accounts", "--bundles"], True)],
+)
+def test_parser_bundles_flag(argv: list[str], use_bundles: bool) -> None:
+    assert cli.build_parser().parse_args(argv).bundles is use_bundles
+
+
+@pytest.mark.parametrize("argv", [[], ["unknown"], ["show", "--bundles"]])
 def test_parser_rejects_missing_or_unknown_command(argv: list[str]) -> None:
     with pytest.raises(SystemExit) as exc:
         cli.build_parser().parse_args(argv)
@@ -49,15 +65,21 @@ def test_main_dispatches_show(monkeypatch: pytest.MonkeyPatch) -> None:
     assert called == ["show"]
 
 
-def test_main_dispatches_close_accounts(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("argv", "use_bundles"),
+    [(["close_accounts"], False), (["close_accounts", "--bundles"], True)],
+)
+def test_main_dispatches_close_accounts(
+    monkeypatch: pytest.MonkeyPatch, argv: list[str], use_bundles: bool
+) -> None:
     called = []
 
-    async def fake_close() -> None:
-        called.append("close")
+    async def fake_close(use_bundles: bool = False) -> None:
+        called.append(("close", use_bundles))
 
     monkeypatch.setattr(cli, "_close_all_accounts", fake_close)
-    assert cli.main(["close_accounts"]) == 0
-    assert called == ["close"]
+    assert cli.main(argv) == 0
+    assert called == [("close", use_bundles)]
 
 
 def test_main_reports_errors_and_returns_1(
@@ -69,6 +91,80 @@ def test_main_reports_errors_and_returns_1(
     monkeypatch.setattr(cli, "_show_wallet_status", boom)
     assert cli.main(["show"]) == 1
     assert "rpc down" in capsys.readouterr().out
+
+
+# --- console colors ---------------------------------------------------------
+
+
+def test_console_colors_plain_when_terminal_cannot_colorize(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("_colorize.can_colorize", lambda **_k: False)
+    assert cli.ConsoleColors().title("hello") == "hello"
+
+
+def test_console_colors_ansi_when_terminal_can_colorize(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("_colorize.can_colorize", lambda **_k: True)
+    colors = cli.ConsoleColors()
+    for styled in (colors.title("x"), colors.section("x"), colors.data("x"),
+                   colors.summary("x"), colors.error("x")):
+        assert "x" in styled
+        assert "\x1b[" in styled
+
+
+# --- jito tip floor ---------------------------------------------------------
+
+
+class FakeResponse:
+    def __init__(self, payload: object, error: Exception | None = None):
+        self.payload = payload
+        self.error = error
+
+    def raise_for_status(self) -> None:
+        if self.error:
+            raise self.error
+
+    def json(self) -> object:
+        return self.payload
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ([{"landed_tips_25th_percentile": 0.00001}], 10_500),  # 10_000 lamports + 5% buffer
+        ([{"landed_tips_25th_percentile": 0.0000001}], cli.MIN_JITO_TIP),  # below the floor
+        ([{}], cli.MIN_JITO_TIP),  # field missing
+        ([], cli.MIN_JITO_TIP),  # no data
+    ],
+)
+def test_jito_tip_floor(monkeypatch: pytest.MonkeyPatch, payload: object, expected: int) -> None:
+    calls = []
+
+    def fake_get(url: str, timeout: float) -> FakeResponse:
+        calls.append((url, timeout))
+        return FakeResponse(payload)
+
+    monkeypatch.setattr(cli.requests, "get", fake_get)
+    assert cli._get_minimum_jito_tip_in_lamports() == expected
+    assert calls == [(cli.JITO_BUNDLES_URL, 5)]
+
+
+@pytest.mark.parametrize(
+    "fake_get",
+    [
+        lambda *_a, **_k: (_ for _ in ()).throw(ConnectionError("offline")),
+        lambda *_a, **_k: FakeResponse(None, error=RuntimeError("503 offline")),
+    ],
+    ids=["request-fails", "http-error"],
+)
+def test_jito_tip_floor_falls_back_when_api_is_down(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], fake_get: object
+) -> None:
+    monkeypatch.setattr(cli.requests, "get", fake_get)
+    assert cli._get_minimum_jito_tip_in_lamports() == cli.MIN_JITO_TIP
+    out = capsys.readouterr().out
+    assert "Failed to fetch Jito tip floor" in out
+    assert "offline" in out
 
 
 # --- token type -------------------------------------------------------------
@@ -115,18 +211,19 @@ def test_min_transaction_fee() -> None:
 def test_show_reports_balances_and_costs(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    accounts = {KEG: [make_rpc_account(0.0) for _ in range(21)], T2022: [make_rpc_account(0.0)]}
+    accounts = {KEG: empty_accounts(PER_TX), T2022: empty_accounts(1)}
     monkeypatch.setattr(cli, "AsyncClient", lambda _url: FakeAsyncClient(accounts))
     monkeypatch.setattr("builtins.input", lambda _prompt: str(Pubkey.new_unique()))
 
     asyncio.run(cli._show_wallet_status())
     out = capsys.readouterr().out
 
-    lamports = 22 * LAMPORTS_PER_TOKEN_ACCOUNT
-    # 22 accounts -> 2 transactions of up to 20 closes, each paying tip + fee
+    total = PER_TX + 1
+    lamports = total * LAMPORTS_PER_TOKEN_ACCOUNT
+    # one more account than fits in a transaction -> 2 transactions, each paying tip + fee
     cost = 2 * (cli.MIN_JITO_TIP + FAKE_TX_FEE)
-    assert "22 =>  21 token-keg + 1 token-2020" in out
-    assert str(lamports / LAMPORTS_PER_SOL) in out
+    assert f"{total} =>  {PER_TX} token-keg + 1 token-2020" in out
+    assert f"{lamports / LAMPORTS_PER_SOL:.2f}" in out
     assert str(lamports) in out
     assert f"{cost / LAMPORTS_PER_SOL:.6f} SOL" in out
 
@@ -150,36 +247,109 @@ def _patch_close(
     monkeypatch.setattr(cli, "JitoJsonRpcSDK", lambda url: jito)
 
 
+def _decode_v1(encoded: str, keypair: Keypair) -> VersionedTransaction:
+    """Decode a sent transaction and check what every close transaction must satisfy."""
+    tx = VersionedTransaction.from_bytes(base64.b64decode(encoded))
+    assert int(tx.version()) == 1
+    assert all(tx.verify_with_results())  # signed by the wallet
+    tx.sanitize()  # raises if the message is malformed, e.g. more than 64 account keys
+    assert len(tx.message.account_keys) <= MAX_V1_ACCOUNT_KEYS
+    assert tx.message.account_keys[0] == keypair.pubkey()  # wallet pays the fees
+    return tx
+
+
+def _tip_data(keypair: Keypair, tip_account: Pubkey, lamports: int) -> bytes:
+    return bytes(transfer(TransferParams(
+        from_pubkey=keypair.pubkey(), to_pubkey=tip_account, lamports=lamports
+    )).data)
+
+
 @pytest.mark.usefixtures("no_sleep")
 def test_close_accounts_batches_and_signs(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     keypair = Keypair()
-    rpc = FakeAsyncClient(
-        {KEG: [make_rpc_account(0.0) for _ in range(40)], T2022: [make_rpc_account(0.0)] * 5}
-    )
+    # The second batch mixes both token programs: the worst case for the 64-account v1 limit.
+    rpc = FakeAsyncClient({KEG: empty_accounts(PER_TX + 3), T2022: empty_accounts(PER_TX + 2)})
     jito = FakeJitoClient()
     _patch_close(monkeypatch, keypair, rpc, jito)
 
     asyncio.run(cli._close_all_accounts())
     out = capsys.readouterr().out
 
-    # 45 accounts -> batches of 20, 20, 5
+    total = 2 * PER_TX + 5
     assert len(jito.sent) == 3
     sizes = []
     for encoded in jito.sent:
-        tx = Transaction.from_bytes(base64.b64decode(encoded))
-        tx.verify()  # signed by the wallet
-        assert tx.message.account_keys[0] == keypair.pubkey()  # wallet pays the fees
+        tx = _decode_v1(encoded, keypair)
+        # every transaction starts with the Jito tip
+        tip = tx.message.instructions[0]
+        assert tx.message.account_keys[tip.accounts[1]] == jito.tip_account
+        assert bytes(tip.data) == _tip_data(keypair, jito.tip_account, cli.MIN_JITO_TIP)
         sizes.append(len(tx.message.instructions) - 1)  # minus the Jito tip transfer
-    assert sizes == [20, 20, 5]
+    assert sizes == [PER_TX, PER_TX, 5]
 
     # progress counter is cumulative
-    assert "Accounts Processed: 20/45" in out
-    assert "Accounts Processed: 40/45" in out
-    assert "Accounts Processed: 45/45" in out
+    assert f"Accounts Processed: {PER_TX}/{total}" in out
+    assert f"Accounts Processed: {2 * PER_TX}/{total}" in out
+    assert f"Accounts Processed: {total}/{total}" in out
     assert "['sig1', 'sig2', 'sig3']" in out
     assert rpc.closed
+
+
+@pytest.mark.usefixtures("no_sleep")
+def test_close_accounts_in_bundles(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bundle_tip = 12_345
+    keypair = Keypair()
+    # One full bundle plus a 2-transaction bundle. The second bundle's first transaction carries
+    # the tip and mixes both token programs: the worst case for the 64-account v1 limit.
+    total = PER_TX * PER_BUNDLE + PER_TX + 5
+    keg = PER_TX * PER_BUNDLE + 1
+    rpc = FakeAsyncClient({KEG: empty_accounts(keg), T2022: empty_accounts(total - keg)})
+    jito = FakeJitoClient()
+    _patch_close(monkeypatch, keypair, rpc, jito)
+    monkeypatch.setattr(cli, "_get_minimum_jito_tip_in_lamports", lambda: bundle_tip)
+
+    asyncio.run(cli._close_all_accounts(use_bundles=True))
+    out = capsys.readouterr().out
+
+    assert jito.sent == []
+    assert [len(bundle) for bundle in jito.bundles] == [PER_BUNDLE, 2]
+    closes = []
+    for bundle in jito.bundles:
+        for index, encoded in enumerate(bundle):
+            tx = _decode_v1(encoded, keypair)
+            instructions = tx.message.instructions
+            if index == 0:  # only the first transaction of each bundle tips Jito
+                tip = instructions[0]
+                assert tx.message.account_keys[tip.accounts[1]] == jito.tip_account
+                assert bytes(tip.data) == _tip_data(keypair, jito.tip_account, bundle_tip)
+                instructions = instructions[1:]
+            else:
+                assert jito.tip_account not in tx.message.account_keys
+            closes.append(len(instructions))
+    assert closes == [PER_TX] * PER_BUNDLE + [PER_TX, 5]
+
+    assert f"Accounts Processed: {PER_TX * PER_BUNDLE}/{total}" in out
+    assert f"Accounts Processed: {total}/{total}" in out
+    assert "Bundle IDs: ['bundle1', 'bundle2']" in out
+    assert rpc.closed
+
+
+def test_close_accounts_reports_failed_bundles(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rpc = FakeAsyncClient({KEG: empty_accounts(1)})
+    _patch_close(monkeypatch, Keypair(), rpc, FakeJitoClient(fail=True))
+    monkeypatch.setattr(cli, "_get_minimum_jito_tip_in_lamports", lambda: cli.MIN_JITO_TIP)
+
+    asyncio.run(cli._close_all_accounts(use_bundles=True))
+    out = capsys.readouterr().out
+
+    assert "Failed to send bundle: rejected" in out
+    assert "Bundle IDs: []" in out
 
 
 @pytest.mark.usefixtures("no_sleep")
