@@ -17,7 +17,7 @@ from solana.rpc.async_api import AsyncClient
 from solana.rpc.models import TokenAccountOpts
 
 from solders.solders import Pubkey, Keypair, MessageV1, TransactionConfig, Instruction
-from solders.compute_budget import set_compute_unit_limit
+from solders.hash import Hash
 from solders.system_program import TransferParams, transfer
 from solders.transaction import VersionedTransaction
 
@@ -31,7 +31,13 @@ from spl.token.models import CloseAccountParams
 # Testnet	https://api.testnet.solana.com	Validator testing network.
 
 MAX_CLOSE_INSTRUCTIONS_PER_TRANSACTION: Final[int] = 59
-COMPUTE_UNITS_PER_INSTRUCTION: Final[int] = 300
+# v1 transactions get no network defaults: an unset compute-unit or loaded-data limit is 0 and
+# the transaction fails (MaxLoadedAccountsDataSizeExceeded). Measured on mainnet: a Token-2022
+# close uses ~1,464 CU, a Token-Keg close ~120 CU and the tip transfer 150 CU, so 3,000 CU per
+# instruction leaves 2x headroom. Loading the Token-2022 program alone is ~1.38 MB; 64 MiB is the
+# runtime maximum and what legacy transactions get by default.
+COMPUTE_UNITS_PER_INSTRUCTION: Final[int] = 3_000
+MAX_LOADED_ACCOUNTS_DATA_SIZE: Final[int] = 64 * 1024 * 1024
 MIN_JITO_TIP: Final[int] = 1000
 JITO_RPC_SDK:  Final[str] = 'https://mainnet.block-engine.jito.wtf/api/v1'
 JITO_BUNDLES_URL:  Final[str] = 'https://bundles.jito.wtf/api/v1/bundles/tip_floor'
@@ -160,6 +166,10 @@ async def _get_min_transaction_fee(client: AsyncClient) -> int:
 async def _close_all_accounts(use_bundles: bool = False) -> None:
 
     colors = ConsoleColors()
+
+    if use_bundles:
+        print(colors.error("Bundles almost never land, must be low tip issues. use with caution."))
+
     private_key = Keypair.from_base58_string(getpass.getpass("Wallet private key: ", echo_char='*').strip())
     jito_client = JitoJsonRpcSDK(url=JITO_RPC_SDK)
     client = AsyncClient(SOLANA_RPC)
@@ -192,6 +202,17 @@ async def _close_all_accounts(use_bundles: bool = False) -> None:
 
     await client.close()
 
+def _build_v1_transaction(
+    private_key: Keypair, instructions: list[Instruction], blockhash: Hash
+) -> VersionedTransaction:
+    """Compile and sign a v1 transaction with explicit limits (see COMPUTE_UNITS_PER_INSTRUCTION)."""
+    config = TransactionConfig(
+        compute_unit_limit=COMPUTE_UNITS_PER_INSTRUCTION * len(instructions),
+        loaded_accounts_data_size_limit=MAX_LOADED_ACCOUNTS_DATA_SIZE,
+    )
+    message = MessageV1.try_compile(private_key.pubkey(), instructions, blockhash, config)
+    return VersionedTransaction(message, [private_key])
+
 async def _close_all_accounts_single_tx(close_instructions: list[Instruction], private_key: Keypair, jito_client: JitoJsonRpcSDK, client: AsyncClient, jito_tip_account: Pubkey) -> None:
     trx_ids = []
     processed_accounts = 0
@@ -207,14 +228,9 @@ async def _close_all_accounts_single_tx(close_instructions: list[Instruction], p
         ]
 
         recent_blockhash = await client.get_latest_blockhash()
-        message = MessageV1.try_compile(
-            private_key.pubkey(),
-            base_instructions + list(instruction_set),
-            recent_blockhash.value.blockhash,
-            # not needed. v1 equivalent of set_compute_unit_limit above (no extra instruction).
-            # config=TransactionConfig(compute_unit_limit=COMPUTE_UNITS_PER_INSTRUCTION * ( len(instruction_set) + 2 )),
+        transaction = _build_v1_transaction(
+            private_key, base_instructions + list(instruction_set), recent_blockhash.value.blockhash
         )
-        transaction = VersionedTransaction(message, [private_key])
 
         result = jito_client.send_txn(params=base64.b64encode(bytes(transaction)).decode('ascii'), bundleOnly=False)
 
@@ -249,12 +265,9 @@ async def _close_all_accounts_bundle(close_instructions: list[Instruction], priv
                 )
 
             recent_blockhash = await client.get_latest_blockhash()
-            message = MessageV1.try_compile(
-                private_key.pubkey(),
-                base_instructions + list(instruction_set),
-                recent_blockhash.value.blockhash
+            transaction = _build_v1_transaction(
+                private_key, base_instructions + list(instruction_set), recent_blockhash.value.blockhash
             )
-            transaction = VersionedTransaction(message, [private_key])
             bundle.append(base64.b64encode(bytes(transaction)).decode('ascii'))
 
         result = jito_client.send_bundle(bundle)

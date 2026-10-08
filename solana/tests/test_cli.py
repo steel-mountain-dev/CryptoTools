@@ -1,12 +1,18 @@
 import asyncio
 import base64
+import struct
 
 import pytest
+import spl.token.instructions as spl_token
 from solana.constants import LAMPORTS_PER_SOL
+from solders.account import Account
 from solders.keypair import Keypair
+from solders.litesvm import LiteSVM
 from solders.pubkey import Pubkey
 from solders.system_program import TransferParams, transfer
 from solders.transaction import VersionedTransaction
+from solders.transaction_metadata import TransactionMetadata
+from spl.token.models import CloseAccountParams
 
 from solana_tools import cli
 from tests.conftest import (
@@ -255,6 +261,12 @@ def _decode_v1(encoded: str, keypair: Keypair) -> VersionedTransaction:
     tx.sanitize()  # raises if the message is malformed, e.g. more than 64 account keys
     assert len(tx.message.account_keys) <= MAX_V1_ACCOUNT_KEYS
     assert tx.message.account_keys[0] == keypair.pubkey()  # wallet pays the fees
+    # v1 has no network defaults: an unset limit is 0 and the transaction fails on mainnet
+    config = tx.message.config
+    assert config.compute_unit_limit == (
+        cli.COMPUTE_UNITS_PER_INSTRUCTION * len(tx.message.instructions)
+    )
+    assert config.loaded_accounts_data_size_limit == cli.MAX_LOADED_ACCOUNTS_DATA_SIZE
     return tx
 
 
@@ -376,3 +388,64 @@ def test_close_accounts_with_nothing_to_close(
 
     assert "No accounts found" in capsys.readouterr().out
     assert jito.sent == []
+
+
+# --- transaction limits (executed in a local Solana VM) ---------------------
+
+# Loading the Token-2022 program on mainnet is ~1.38 MB, a full mixed batch ~1.5 MB.
+MAINNET_WORST_CASE_LOADED_BYTES = 1_504_674
+
+
+def _token_account_data(owner: Pubkey, program: Pubkey) -> bytes:
+    """An initialized, empty SPL token account, as the token programs lay it out."""
+    data = (
+        bytes(Pubkey.new_unique())  # mint
+        + bytes(owner)
+        + struct.pack("<Q", 0)  # amount
+        + bytes(36)  # delegate: none
+        + b"\x01"  # state: initialized
+        + bytes(12)  # is_native: none
+        + struct.pack("<Q", 0)  # delegated amount
+        + bytes(36)  # close authority: none
+    )
+    if program == T2022:  # account type + ImmutableOwner extension, like real Token-2022 accounts
+        data += b"\x02" + struct.pack("<HH", 7, 0)
+    return data
+
+
+@pytest.mark.parametrize(
+    "counts",
+    [{T2022: PER_TX}, {KEG: PER_TX}, {KEG: PER_TX // 2, T2022: PER_TX - PER_TX // 2}],
+    ids=["all-token-2022", "all-token-keg", "mixed"],
+)
+def test_full_batch_executes_within_its_compute_budget(counts: dict[Pubkey, int]) -> None:
+    svm = LiteSVM()
+    owner = Keypair()
+    tip_account = Pubkey.new_unique()
+    svm.airdrop(owner.pubkey(), 10**10)
+    svm.airdrop(tip_account, 10**9)
+
+    instructions = [transfer(TransferParams(
+        from_pubkey=owner.pubkey(), to_pubkey=tip_account, lamports=cli.MIN_JITO_TIP
+    ))]
+    closed = []
+    for program, count in counts.items():
+        for _ in range(count):
+            address = Pubkey.new_unique()
+            data = _token_account_data(owner.pubkey(), program)
+            rent = svm.minimum_balance_for_rent_exemption(len(data))
+            svm.set_account(address, Account(rent, data, program, False, 0))
+            instructions.append(spl_token.close_account(CloseAccountParams(
+                program_id=program, account=address, dest=owner.pubkey(), owner=owner.pubkey()
+            )))
+            closed.append(address)
+
+    tx = cli._build_v1_transaction(owner, instructions, svm.latest_blockhash())
+    result = svm.send_transaction(tx)
+
+    # LiteSVM does not enforce v1 limits, so compare what was used against what was requested
+    assert isinstance(result, TransactionMetadata), result  # FailedTransactionMetadata otherwise
+    assert result.compute_units_consumed() <= tx.message.config.compute_unit_limit
+    assert MAINNET_WORST_CASE_LOADED_BYTES <= tx.message.config.loaded_accounts_data_size_limit
+    assert all(svm.get_account(address) is None for address in closed)
+

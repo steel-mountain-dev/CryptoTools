@@ -14,7 +14,7 @@ async def main():
     print(f"batch_l1: {batch_l1}")
 
     jito_client = JitoJsonRpcSDK(url="https://mainnet.block-engine.jito.wtf/api/v1")
-    response = jito_client.get_inflight_bundle_statuses(['c5af456d35d9786d916bc5bbeee91083b50eedaee1fff8c6a3b96111fca8b348'])
+    response = jito_client.get_bundle_statuses(['26fa469392fa4ca220936f830bf21565fe34ede761b190ed87f72738cfd7dd2e'])
     print(response)
 
     tip_needed = get_minimum_jito_tip_in_lamports()
