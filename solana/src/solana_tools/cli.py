@@ -3,7 +3,6 @@ import asyncio
 import base64
 import getpass
 import math
-import traceback
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -23,7 +22,7 @@ from solders.transaction import VersionedTransaction
 
 import spl.token.instructions as spl_token
 from spl.token.constants import TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID
-from spl.token.models import CloseAccountParams
+from spl.token.models import CloseAccountParams, BurnParams
 
 # Cluster	Public RPC endpoint	Description
 # Mainnet	https://api.mainnet.solana.com	Production network using real SOL.
@@ -74,6 +73,7 @@ class TokenAccount:
     address: Pubkey
     lamports: int
     program_id: Pubkey
+    mint: Pubkey
 
 
 class TokenType(Enum):
@@ -331,7 +331,10 @@ async def _get_zero_balance_token_accounts(wallet: Pubkey, client: AsyncClient) 
                     TokenAccount(
                         address = account.pubkey,
                         lamports = account.account.lamports,
-                        program_id= token_program.address))
+                        program_id= token_program.address,
+                        mint = Pubkey.from_string(account.account.data.parsed['info']['mint'])
+                    )
+                )
 
 
     return zero_balance_accounts
