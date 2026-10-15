@@ -13,14 +13,19 @@ LAMPORTS_PER_TOKEN_ACCOUNT = 2_039_280
 FAKE_TX_FEE = 5_000
 
 
-def make_rpc_account(ui_amount: float, lamports: int = LAMPORTS_PER_TOKEN_ACCOUNT) -> Any:
-    """Mimic one item of ``get_token_accounts_by_owner_json_parsed(...).value``."""
+def make_rpc_account(
+    ui_amount: float, lamports: int = LAMPORTS_PER_TOKEN_ACCOUNT, mint: Pubkey | None = None
+) -> Any:
+    """Mimic one item of ``get_token_accounts_by_owner_json_parsed(...).value``.
+
+    ``.mint`` is a test-only shortcut to the mint stored in the parsed data.
+    """
+    mint = mint or Pubkey.new_unique()
+    info = {"mint": str(mint), "tokenAmount": {"uiAmount": ui_amount}}
     return SimpleNamespace(
         pubkey=Pubkey.new_unique(),
-        account=SimpleNamespace(
-            lamports=lamports,
-            data=SimpleNamespace(parsed={"info": {"tokenAmount": {"uiAmount": ui_amount}}}),
-        ),
+        mint=mint,
+        account=SimpleNamespace(lamports=lamports, data=SimpleNamespace(parsed={"info": info})),
     )
 
 

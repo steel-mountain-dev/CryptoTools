@@ -174,7 +174,7 @@ async def _close_all_accounts(use_bundles: bool = False) -> None:
     jito_client = JitoJsonRpcSDK(url=JITO_RPC_SDK)
     client = AsyncClient(SOLANA_RPC)
 
-    accounts = await _get_zero_balance_token_accounts(private_key.pubkey(), client)
+    accounts = await _get_token_accounts(private_key.pubkey(), client, zero_balance_only=True)
     print(f"address: {private_key.pubkey()}")
 
     if len(accounts) == 0:
@@ -286,7 +286,7 @@ async def _show_wallet_status() -> None:
         return
 
     client = AsyncClient(SOLANA_RPC)
-    accounts = await _get_zero_balance_token_accounts(Pubkey.from_string(wallet_int), client)
+    accounts = await _get_token_accounts(Pubkey.from_string(wallet_int), client, zero_balance_only=True)
 
     lamports = 0
 
@@ -312,7 +312,7 @@ async def _show_wallet_status() -> None:
     print(colors.section("    approximate close costs:\t") + colors.data(f"{cost / LAMPORTS_PER_SOL :.6f} SOL"))
 
 
-async def _get_zero_balance_token_accounts(wallet: Pubkey, client: AsyncClient) -> Sequence[TokenAccount]:
+async def _get_token_accounts(wallet: Pubkey, client: AsyncClient, *, zero_balance_only: bool) -> Sequence[TokenAccount]:
 
     if not await client.is_connected():
         raise Exception("Client is not connected")
@@ -326,7 +326,7 @@ async def _get_zero_balance_token_accounts(wallet: Pubkey, client: AsyncClient) 
         )
 
         for account in token_accounts.value:
-            if float(account.account.data.parsed['info']['tokenAmount']['uiAmount']) == 0:
+            if not zero_balance_only  or (zero_balance_only and float(account.account.data.parsed['info']['tokenAmount']['uiAmount']) == 0):
                 zero_balance_accounts.append(
                     TokenAccount(
                         address = account.pubkey,

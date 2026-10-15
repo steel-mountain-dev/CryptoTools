@@ -99,6 +99,25 @@ def test_main_reports_errors_and_returns_1(
     assert "rpc down" in capsys.readouterr().out
 
 
+def _raise_keyboard_interrupt(*_a: object, **_k: object) -> str:
+    raise KeyboardInterrupt
+
+
+@pytest.mark.parametrize(
+    ("argv", "prompt"),
+    [(["show"], "builtins.input"), (["close_accounts"], "getpass.getpass")],
+)
+def test_main_ctrl_c_exits_130(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    argv: list[str],
+    prompt: str,
+) -> None:
+    monkeypatch.setattr(prompt, _raise_keyboard_interrupt)
+    assert cli.main(argv) == 130
+    assert "Cancelled." in capsys.readouterr().out
+
+
 # --- console colors ---------------------------------------------------------
 
 
@@ -181,7 +200,7 @@ def test_token_type_addresses() -> None:
     assert T2022 == Pubkey.from_string("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
 
 
-# --- get_zero_balance_token_accounts ---------------------------------------
+# --- get_token_accounts -----------------------------------------------------
 
 
 def test_zero_balance_accounts_are_filtered_across_both_programs() -> None:
@@ -190,18 +209,50 @@ def test_zero_balance_accounts_are_filtered_across_both_programs() -> None:
     empty_2022 = make_rpc_account(0.0, lamports=3_000_000)
     client = FakeAsyncClient({KEG: [empty_keg, funded_keg], T2022: [empty_2022]})
 
-    result = asyncio.run(cli._get_zero_balance_token_accounts(Pubkey.new_unique(), client))
+    result = asyncio.run(
+        cli._get_token_accounts(Pubkey.new_unique(), client, zero_balance_only=True)
+    )
 
     assert result == [
-        cli.TokenAccount(empty_keg.pubkey, LAMPORTS_PER_TOKEN_ACCOUNT, KEG),
-        cli.TokenAccount(empty_2022.pubkey, 3_000_000, T2022),
+        cli.TokenAccount(empty_keg.pubkey, LAMPORTS_PER_TOKEN_ACCOUNT, KEG, empty_keg.mint),
+        cli.TokenAccount(empty_2022.pubkey, 3_000_000, T2022, empty_2022.mint),
     ]
+
+
+def test_all_token_accounts_when_not_filtering_zero_balances() -> None:
+    empty_keg = make_rpc_account(0.0)
+    funded_keg = make_rpc_account(12.5)
+    funded_2022 = make_rpc_account(0.5, lamports=3_000_000)
+    client = FakeAsyncClient({KEG: [empty_keg, funded_keg], T2022: [funded_2022]})
+
+    result = asyncio.run(
+        cli._get_token_accounts(Pubkey.new_unique(), client, zero_balance_only=False)
+    )
+
+    assert result == [
+        cli.TokenAccount(empty_keg.pubkey, LAMPORTS_PER_TOKEN_ACCOUNT, KEG, empty_keg.mint),
+        cli.TokenAccount(funded_keg.pubkey, LAMPORTS_PER_TOKEN_ACCOUNT, KEG, funded_keg.mint),
+        cli.TokenAccount(funded_2022.pubkey, 3_000_000, T2022, funded_2022.mint),
+    ]
+
+
+def test_token_account_mint_is_parsed() -> None:
+    mint = Pubkey.from_string("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
+    client = FakeAsyncClient({KEG: [make_rpc_account(0.0, mint=mint)]})
+
+    [account] = asyncio.run(
+        cli._get_token_accounts(Pubkey.new_unique(), client, zero_balance_only=True)
+    )
+
+    assert account.mint == mint
 
 
 def test_zero_balance_accounts_requires_connection() -> None:
     client = FakeAsyncClient({}, connected=False)
     with pytest.raises(Exception, match="not connected"):
-        asyncio.run(cli._get_zero_balance_token_accounts(Pubkey.new_unique(), client))
+        asyncio.run(
+            cli._get_token_accounts(Pubkey.new_unique(), client, zero_balance_only=True)
+        )
 
 
 # --- get_min_transaction_fee -----------------------------------------------
